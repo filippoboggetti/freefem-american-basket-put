@@ -1,0 +1,304 @@
+// ---------------------------------------------------------------------
+//  american_basket_put.edp
+//
+//  Pricing an AMERICAN PUT ON THE MAXIMUM OF TWO ASSETS
+//  (payoff max(K - max(S1,S2), 0)) under two-dimensional Black-Scholes
+//  with the finite element method (P1 Lagrange elements, adaptive mesh):
+//  the early-exercise constraint makes the problem a variational
+//  inequality, solved at each time step with a primal-dual active-set
+//  (semi-smooth Newton) iteration.  Optionally the European put with the
+//  same parameters is priced as a benchmark.
+//
+//  Revised version (September 2026) of the January-2024 project script
+//  original/VIA-american_r2.edp (F. F. Boggetti, A. Cesari, I. Lotti).
+//  The numerical method is unchanged; the revision fixes
+//    * the time loop: exactly nSteps = T/dt backward steps (the original
+//      inclusive test "iter*dt <= T" took 101 steps, i.e. maturity 1.01),
+//    * the terminal condition: the lagged solution uhp starts at the payoff
+//      (the original started it at 0 for the first step),
+//    * the active-set loop: convergence is tracked and time steps that hit
+//      the iteration cap without the convergence test firing are counted
+//      and reported,
+//  and adds, at the end of the run, explicit checks of the no-arbitrage
+//  invariants (American >= intrinsic value; in COMPAREMODE American >=
+//  European) with the largest violation printed against a tolerance.
+//  Output file names are those of the original script.
+// ---------------------------------------------------------------------
+
+//--- switch mode: true  = price American and European and compare
+//                 false = American only
+bool COMPAREMODE = true;
+
+//--- algorithm parameters
+int m = 40;             // initial mesh: m x m squares
+int L = 80;             // domain [0,L] x [0,LL]
+int LL = 80;
+int j = -1;
+int kmax = 30;          // cap on active-set iterations per time step (original: 7)
+int k = 0;
+//---
+
+//--- financial parameters
+real T = 1;             // maturity (years)
+real sigmax = 0.35;     // volatility of S1
+real sigmay = 0.3;      // volatility of S2
+real rho = -0.3;        // correlation
+real r = 0.02;          // risk-free rate
+real K = 40;            // strike
+real dt = 0.01;         // time step
+int nSteps = lrint(T/dt);   // number of backward time steps (exactly T/dt)
+//---
+
+//--- tolerances
+bool debug = false;
+real eps = 1e-10;               // L2 stopping tolerance of the active-set loop
+real tol = 0.0005, tolmin = 0.0001;   // adaptmesh tolerance, halved down to tolmin
+real tgv = 1e30;                // exact penalisation of boundary/active constraints
+real c = 1000;                  // active-set parameter
+int kj = 2;                     // forces n-1 mesh adaptations over the horizon
+real invTol = 2e-2;             // tolerance for the final invariant checks (price units; 0.05% of K)
+//---
+
+mesh Th = square(m, m, [L*x, LL*y]);
+fespace Vh(Th, P1);         // P1 finite-element space
+int ndof = Vh.ndof;         // number of degrees of freedom
+Vh uh, uhp, aux;            // solution, previous time step, auxiliary
+Vh Ik;                      // indicator of the active (exercise) set
+Vh vh;
+real[int] Aii(ndof), Aiin(ndof);   // matrix diagonal
+real[int] rhs(ndof);
+
+// payoff and terminal condition
+func e = max(K - max(x, y), 0.);
+Vh pay = e;
+uh = pay;
+uhp = pay;                  // terminal condition u(T) = payoff (original: uhp = 0)
+Vh xveloc = -x*r + x*sigmax^2 + x*rho*sigmax*sigmay/2;
+Vh yveloc = -y*r + y*sigmay^2 + y*rho*sigmax*sigmay/2;
+
+// variational form (backward Euler in time, characteristics for the drift)
+varf a(uh, vh) = int2d(Th)( uh*vh*(r + 1/dt)
+                + dx(uh)*dx(vh)*(x*sigmax)^2/2 + dy(uh)*dy(vh)*(y*sigmay)^2/2
+                + (dy(uh)*dx(vh) + dx(uh)*dy(vh))*rho*sigmax*sigmay*x*y/2 )
+                - int2d(Th)( vh*convect([xveloc, yveloc], dt, uhp)/dt )
+                + on(2, 3, uh=0);
+
+matrix A = a(Vh, Vh, tgv=tgv, solver=CG);
+matrix AA = a(Vh, Vh);
+
+// mass matrix for the L2 norm
+varf vM(uh, vh) = int2d(Th)(uh*vh);
+matrix M = vM(Vh, Vh);
+Aii = A.diag;
+
+rhs = a(0, Vh, tgv=tgv);
+Ik = 0;
+Vh lambda = 0;
+int kadapt = 0, kkadapt = 0;
+int iter = 0;
+real[int] b(ndof);
+real[int] Ak(ndof);
+int nHitCap = 0;            // time steps where the active-set loop hit kmax without converging
+real maxExitErr = 0;        // largest L2 change at exit among those steps
+
+cout << "===============================================================" << endl;
+cout << "==   American put on max(S1,S2): active-set FEM (P1, adaptive) ==" << endl;
+cout << "    T=" << T << " sigmax=" << sigmax << " sigmay=" << sigmay << " rho=" << rho
+     << " r=" << r << " K=" << K << " dt=" << dt << " steps=" << nSteps << endl;
+cout << "===============================================================" << endl;
+
+real time = clock();
+
+for (iter = 0; iter < nSteps; iter++)
+{
+    k = 0;
+    aux = 0;
+    bool converged = false;
+    real err = 0;
+    while (k < kmax)
+    {
+        aux = uh;
+        rhs = a(0, Vh, tgv=tgv);
+        b = rhs;
+        Ak = 1.;
+        Ak -= Ik[];                     // complement of the active set
+        // impose uh = pay on the active set through the penalisation
+        b = Ik[] .* pay[];
+        b *= tgv;
+        b -= Ak .* rhs;
+        Aiin = Ik[] * tgv;
+        Aiin += Ak .* Aii;
+        A.diag = Aiin;
+        set(A, solver=CG);
+        uh[] = A^-1 * b;                // solve with the current active set
+        lambda[] = AA * uh[];           // multiplier (residual)
+        lambda[] = -rhs - lambda[];
+        Ik = (lambda + c*(uh - pay)) < 0;   // update the active set
+        // L2 norm of the change within the active-set iteration
+        real[int] diff(ndof), Mdiff(ndof);
+        diff = uh[] - aux[];
+        Mdiff = M*diff;
+        err = sqrt(Mdiff'*diff);
+        if (err < eps && kkadapt) { converged = true; break; }
+        bool adapt = err < eps || (j > T/dt/kj);
+        if (adapt && iter > 0)
+        {
+            kadapt++;
+            j = 0;
+            Th = adaptmesh(Th, uh, err=tol);
+            kkadapt = tol == tolmin;
+            tol = max(tol/2, tolmin);
+            xveloc = -x*r + x*sigmax^2 + x*rho*sigmax*sigmay/2;
+            yveloc = -y*r + y*sigmay^2 + y*rho*sigmax*sigmay/2;
+            vh = max(uh, pay) - pay;
+            uhp = uhp;                  // interpolate everything on the new mesh
+            ndof = uhp.n;
+            uh = uh;
+            Ik = Ik;
+            lambda = lambda;
+            pay = e;
+            A = a(Vh, Vh, tgv=tgv, solver=CG);
+            AA = a(Vh, Vh);
+            M = vM(Vh, Vh);
+            Aii.resize(ndof);
+            Aiin.resize(ndof);
+            Ak.resize(ndof);
+            b.resize(ndof);
+            rhs.resize(ndof);
+            Aii = A.diag;
+        }
+        k++;
+    }
+    if (!converged) { nHitCap++; maxExitErr = max(maxExitErr, err); }
+    j++;
+    uhp[] = uh[];                       // advance one time step backward
+}
+
+real solveTime = clock() - time;
+cout << endl;
+cout << "===============================================" << endl;
+cout << " solve time (s)          : " << solveTime << endl;
+cout << " time steps              : " << nSteps << endl;
+cout << " mesh adaptations        : " << kadapt << "  (final dof " << ndof << ")" << endl;
+cout << " steps at iteration cap  : " << nHitCap << " of " << nSteps
+     << "  (largest L2 change at exit " << maxExitErr << ")" << endl;
+cout << " uh(0,0)   = " << uh(0,0) << "   (intrinsic value K = " << K << ")" << endl;
+cout << " uh(35,41) = " << uh(35,41) << endl;
+cout << "===============================================" << endl;
+
+// ---- invariant 1: American >= intrinsic value (nodal values) ----
+real worstIntr = 0;
+{
+    real[int] d(ndof);
+    d = uh[] - pay[];
+    worstIntr = d.min;
+}
+cout << " check  American - intrinsic >= 0 : min over nodes = " << worstIntr
+     << (worstIntr > -invTol ? "   PASS" : "   WARN") << " (tol " << invTol << ")" << endl;
+
+if (COMPAREMODE)
+{
+    cout << "===============================================================" << endl;
+    cout << "==   European put on max(S1,S2), same parameters (benchmark) ==" << endl;
+    cout << "===============================================================" << endl;
+
+    mesh The = square(m, m, [L*x, LL*y]);
+    fespace Vhe(The, P1);
+    Vhe vhe, uhpe, uhe = max(K - max(x, y), 0.);
+    j = 100;
+    for (int n = 0; n < nSteps; n++)
+    {
+        if (j > 10)
+        {
+            The = adaptmesh(The, uhe, verbosity=1, abserror=1, nbjacoby=2,
+                            err=0.001, nbvx=5000, omega=1.8, ratio=1.8, nbsmooth=3,
+                            splitpbedge=1, maxsubdiv=5, rescaling=1);
+            j = 0;
+            xveloc = -x*r + x*sigmax^2 + x*rho*sigmax*sigmay/2;
+            yveloc = -y*r + y*sigmay^2 + y*rho*sigmax*sigmay/2;
+            uhe = uhe;
+        }
+        uhpe = uhe;
+        solve ae(uhe, vhe, init=j, solver=LU)
+            = int2d(The)( uhe*vhe*(r + 1/dt)
+                  + dx(uhe)*dx(vhe)*(x*sigmax)^2/2 + dy(uhe)*dy(vhe)*(y*sigmay)^2/2
+                  + (dy(uhe)*dx(vhe) + dx(uhe)*dy(vhe))*rho*sigmax*sigmay*x*y/2 )
+              - int2d(The)( vhe*convect([xveloc, yveloc], dt, uhpe)/dt )
+              + on(2, 3, uhe=0);
+        j = j + 1;
+    }
+
+    // ---- invariant 2: American >= European (European interpolated on the American mesh) ----
+    Vh uheOnTh = uhe;
+    real worstEE = 0; int iworst = 0;
+    {
+        real[int] d(ndof);
+        d = uh[] - uheOnTh[];
+        worstEE = d.min; iworst = d.imin;
+    }
+    cout << " uhe(0,0)  = " << uhe(0,0) << "   (K e^{-rT} = " << K*exp(-r*T) << ")" << endl;
+    cout << " check  American - European >= 0  : min over nodes = " << worstEE
+         << " at (S1,S2) = (" << Th(iworst).x << "," << Th(iworst).y << ")"
+         << (worstEE > -invTol ? "   PASS" : "   WARN") << " (tol " << invTol << ")" << endl;
+
+    // plots (skipped with -nw)
+    Vh v = uh - uhe;
+    Vh w = max(uh, pay) - pay;
+    plot(uh, uhe, bb=[[0,0],[40,40]], dim=3, fill=true, wait=true, nbiso=20,
+         cmm="American vs European put on max(S1,S2) -- rotate to see American above European", value=true);
+    plot(v, wait=true, cmm="Early exercise premium", value=true, nbiso=60);
+    plot(v, dim=3, fill=true, wait=true, cmm="Early exercise premium (3D)", value=true, nbiso=40);
+    plot(w, dim=3, fill=true, wait=true, cmm="Time value (3D)", value=true, nbiso=40);
+    savemesh(Th, "mm-VIA-american", [x, y, uh*1]);
+    savemesh(The, "mm-VIA-european", [x, y, uhe*1]);
+    {
+        ofstream ff("graphTime value of the option 3D.txt");
+        for (int i = 0; i < Th.nt; i++)
+        {
+            for (int jj = 0; jj < 3; jj++)
+                ff << Th[i][jj].x << "    " << Th[i][jj].y << "  " << w[][Vh(i,jj)] << endl;
+            ff << Th[i][0].x << "    " << Th[i][0].y << "  " << w[][Vh(i,0)] << endl << endl << endl;
+        }
+    }
+    // diagonal cut S1 = S2 = i, i = 0..L-1, for comparison in a text editor
+    real[int] xx(L), yy(L), zz(L);
+    for (int i = 0; i < L; i++)
+    {
+        xx[i] = i;
+        yy[i] = uh(i, i);       // American at (i,i)
+        zz[i] = uhe(i, i);      // European at (i,i)
+    }
+    plot([xx,yy], [xx,zz], bb=[[0,0],[80,80]], cmm="American vs European put along S1 = S2", value=true,
+         ps="Compare AMERICAN-EUROPEAN.eps", wait=true, aspectratio=true);
+    {
+        ofstream gnu("plotCOMPAREamerican-european.txt");
+        gnu << "x-axis uhAmerican(y=x) uheEuropean(y=x)" << endl;
+        for (int i = 0; i < L; i++)
+            gnu << xx[i] << " " << yy[i] << " " << zz[i] << endl;
+    }
+}
+else
+{
+    vh = max(uh, pay) - pay;
+    plot(vh, wait=1, value=1, fill=1, cmm="Time value of the option");
+    plot(vh, dim=3, wait=1, value=1, fill=1, cmm="Time value of the option (3D)");
+    plot(vh, bb=[[20,20],[50,50]], value=1, fill=0, cmm="time value, zoomed", ps="VIA-vhamerican.eps", wait=1, nbiso=50);
+    plot(uh, wait=1, value=1, fill=1, cmm="uh");
+    plot(uh, wait=1, value=1, fill=0, cmm="uh", ps="VIA-uhamerican.eps", nbiso=50);
+    plot(uh, bb=[[0,0],[40,40]], dim=3, fill=true, wait=true, nbiso=20, cmm="American put (3D)", value=true);
+    plot(Th, cmm="Th", ps="VIA-Thamerican.eps", wait=1);
+    plot(Th, bb=[[20,20],[50,50]], cmm="Th, zoomed", wait=1);
+    savemesh(Th, "mm-VIA-american", [x, y, uh*1]);
+    real[int] xx(L), yy(L);
+    for (int i = 0; i < L; i++)
+    {
+        xx[i] = i;
+        yy[i] = uh(i, i);
+    }
+    plot([xx,yy], bb=[[0,0],[80,80]], cmm="American put along S1 = S2", value=true, ps="VIA-1damerican.eps", wait=true, aspectratio=true);
+    {
+        ofstream gnu("plotVIA-american.gp");
+        for (int i = 0; i < L; i++)
+            gnu << xx[i] << " " << yy[i] << endl;
+    }
+}
