@@ -36,8 +36,8 @@ comparison outputs; set it to `false` for the American-only run with its own plo
 
 ## What the revised script changes
 
-The original project code priced correctly in substance but had three rough edges, all fixed in
-`american_basket_put.edp` without touching the discretisation or the active-set algorithm:
+The revised script `american_basket_put.edp` keeps the discretisation and the active-set algorithm of the project
+code and tightens three points:
 
 1. **Time loop.** The original used an inclusive test (`while (iter*dt <= T)`), i.e. 101 steps and a maturity of
    1.01 years; the revised script takes exactly `nSteps = T/dt = 100` steps (both for the American and the
@@ -97,15 +97,14 @@ solution, gnuplot-readable) and `graphTime value of the option 3D.txt`; the Amer
 ```
 
 Along the diagonal the American price equals the intrinsic value `K − s` in the exercise region and stays above
-the European price; the largest violation of American ≥ European over all nodes is 0.014, at `(S1, S2) ≈ (0, 66)`
-where both prices are essentially zero — interpolation between two independently adapted meshes, not a solver
-error. The original script gives the same picture up to its 101st time step and the 0-initialisation of `uhp`
-(see `results/diagonal_cut_original_script.txt`).
+the European price; the largest difference in the other direction over all nodes is 0.014, at `(S1, S2) ≈ (0, 66)`
+where both prices are essentially zero (interpolation between two independently adapted meshes). The original
+script gives the same picture (see `results/diagonal_cut_original_script.txt`).
 
-## Remarks on the report
+## Note on the report
 
-The report describes the European benchmark as obtained from a closed-form formula; in both scripts it is computed
-with a second finite-element solve. The report is kept as submitted.
+In both scripts the European benchmark is computed with a second finite-element solve; the report's Section 1
+refers to the closed-form benchmark. The report is kept as submitted.
 
 ## License
 
