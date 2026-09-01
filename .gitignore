@@ -1,0 +1,9 @@
+# run outputs written by the script into the working directory
+*.eps
+*.points
+*.faces
+*.gp
+graphTime value of the option 3D.txt
+plotCOMPAREamerican-european.txt
+plotVIA-american.gp
+.DS_Store

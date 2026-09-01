@@ -1,0 +1,363 @@
+// ---------------------------------------------
+//  Problem:
+//  Pricing a basket of two american options
+//  using Partial Differential Equation (PDE).
+//
+//  CAUTION:
+//  The graphs and mesh are optimized for the
+//  financial parameters specified as defaults.
+//  If you want to change them you may need to
+//  resize the mesh and readjust the graphs.
+// 
+//  01.01.24     r0  release
+//  ---
+//  02.01.24     r1  insert boolean COMPAREMODE
+//  if set to true allows comparison of a basket
+//  of American put options with one of European
+//  options having the same financial parameters.
+//  ---
+//  03.01.24     r1a SAVEMESH uh and uhe and 
+//  added new plot.
+//  ---
+//  04.01.24     r2 w in gnuplot txt file 
+//  for complex graph.
+// ---------------------------------------------
+//  ACS  rel.0   1 January 2024 release
+//  ACS  rel.1   2 January 2024 compare with EU
+//  ACS  rel.1a  3 January 2024 add new plot
+//  ACS  rel.2   4 January 2024 add new plot
+//  --------------------------------------------
+
+//--- switch mode from compare american vs european (set to true)
+//    to computing american (set to false)
+bool COMPAREMODE = true;
+
+//--- algo parameters
+int m=40;
+int L=80;
+int LL=80;
+int j=-1;
+int kmax=7;
+int k=0;
+//---
+
+//--- financial parameters
+real T=1;
+real sigmax=0.35;
+real sigmay=0.3;
+real rho=-0.3;
+real r=0.02;
+real K=40;
+real dt=0.01;
+//---
+
+//--- control room for error and tolerance
+bool debug = false;
+real eps=1e-10;
+real tol=0.0005,tolmin=0.0001;
+real res=0.;
+real tgv = 1e30;           // a huge value of exact penalisation of boundary condition
+real c=1000;               // the parameter of the algoritme
+int kj=2;                  // strength, regardless of error, n-1 runs of adaptamesh over time T
+//---
+
+mesh Th=square(m,m,[L*x,LL*y]);
+fespace Vh(Th,P1);         // P1 FE space
+int n = Vh.ndof;           // number of Degree of freedom
+Vh uh,uhp,aux;             // solution, previous one and aux var for internal while cycle.
+Vh Ik;                     // to def the set where the containt is reached.
+Vh vh;
+// array to store
+real[int] Aii(n),Aiin(n);  // store the diagonal of the matrix
+real[int] rhs(n);          // to store the right and side of the equation
+
+
+// American option early exercise and other
+func e = max(K-max(x,y),0.);
+Vh pay=e;
+uh=pay;
+Vh xveloc = -x*r+x*sigmax^2+x*rho*sigmax*sigmay/2;
+Vh yveloc = -y*r+y*sigmay^2+y*rho*sigmax*sigmay/2;
+
+//  the variational form of the problem:
+varf a(uh,vh) = int2d(Th)(  uh*vh*(r+1/dt)
+                + dx(uh)*dx(vh)*(x*sigmax)^2/2 + dy(uh)*dy(vh)*(y*sigmay)^2/2
+                + (dy(uh)*dx(vh) + dx(uh)*dy(vh))*rho*sigmax*sigmay*x*y/2)
+                - int2d(Th)(vh*convect([xveloc,yveloc],dt,uhp)/dt)
+                + on(2,3,uh=0);
+
+
+// two version of the problem
+matrix A=a(Vh,Vh,tgv=tgv,solver=CG);
+matrix AA=a(Vh,Vh);
+
+//  the mass Matrix construction:
+varf vM(uh,vh) = int2d(Th)(uh*vh);
+matrix M=vM(Vh,Vh); // to do a fast computing of $L^2$ norm : sqrt( u'*(w=M*u))
+Aii=A.diag; // get the diagonal of the matrix
+
+rhs = a(0,Vh,tgv=tgv);
+Ik =0;
+uhp=0;
+Vh lambda=0;
+int kadapt=0,kkadapt=0;
+int iter=0;                 // counter for iterate all time T
+real[int] b(n) ;
+real[int] Ak(n);            // the complementary of Ik ( !Ik = (Ik-1))
+
+cout << "===============================================================" << endl;
+cout << "==             computing AMERICAN options basket             ==" << endl;
+cout << "==                                                           ==" << endl;
+cout << "    T="<<T<<" sigmax="<<sigmax<<" sigmay="<<sigmay<<" rho="<<rho<<" r="<<r<<" K="<<K<<" dt="<<dt<<endl;
+cout << "===============================================================" << endl;
+
+// Start counting time
+real time=clock();
+
+// iterate for all time T
+// ATT.-to maintain the uniqueness of the temporal discretization
+// of the parameter T, the variable 'iter' and 'uhp' must always
+// be updated together.
+while (iter*dt <= T)
+{
+    k=0;
+    aux=0;
+    while(k<kmax)
+    {
+        aux=uh;
+        rhs = a(0,Vh,tgv=tgv);
+
+        // solve the problem plot(uh) to see the result
+        b=rhs;                      // get a copy of the Right hand side
+
+        // The operator Ik- 1. is not implement so we do:
+        Ak= 1.;
+        Ak  -= Ik[];        // build Ak  = ! Ik
+
+        //  adding new lock condition on b and on i / if (Ik[i]==1 )
+        b = Ik[] .*pay[];
+        b *= tgv;
+        b  -=  Ak .* rhs;
+        Aiin = Ik[] *  tgv;
+        Aiin  +=  Ak  .* Aii;       // set Aii= tgv  $ i \in Ik $
+        A.diag = Aiin;              // set the matrix diagonal
+        set(A,solver=CG);           // important to change precondiconning  for solving
+
+        //SOLVE THE PROBLEM
+        uh[] = A^-1* b;             // solve the problem with more locking condition
+
+        //plot(uh, cmm = "uh after solver", wait=debug);
+
+        lambda[] = AA * uh[];       // compute the residual ( fast with matrix)
+        lambda[] = -rhs-lambda[];   // remark rhs -
+
+        Ik = (lambda + c*(uh-pay)) < 0;  // set the new value
+
+        //plot(Ik, wait=debug,cmm=" lock set ",value=1 );
+        //plot(uh,wait=debug,cmm="uh");
+
+        // trick to compute  $L^2$ norm of the variation
+        real[int] diff(n),Mdiff(n);
+        //diff= uh[]-uhp[];
+        diff= uh[]-aux[];
+        Mdiff = M*diff;
+        real err = sqrt(Mdiff'*diff);
+        //cout << " *----err norm L2 "<<err<<"---eps = "<<eps<< "---kkadapt = " << kkadapt <<endl;
+
+        // If 'kkadapt' is set to one it means that I have
+        // already performed the adatptamesh with the highest precision set.
+        // See the parameters 'tol' and 'tolmin'.
+        if(err<eps && kkadapt )
+        {
+            //cout <<" STOP test at k = "<<k<<endl;
+            break;//stop test
+        }
+        bool adapt = err<eps || (j>T/dt/kj); //sure for each kj
+        //uncomment for debug
+        //bool adapt = (j>T/dt/10);
+        if(adapt && iter>0)
+        {
+            kadapt++;
+            j=0;
+            Th=adaptmesh(Th,uh,err=tol);
+            kkadapt = tol == tolmin; // we reacht  the bound
+            tol = max(tol/2,tolmin);
+            //cout << " ++ tol = " << tol << " kadapt = " << kadapt << " reachted bound? " << kkadapt <<endl;
+            //plot(Th,wait=debug);
+            //plot(uh, wait=debug);
+            Vh xveloc = -x*r+x*sigmax^2+x*rho*sigmax*sigmay/2;
+            Vh yveloc = -y*r+y*sigmay^2+y*rho*sigmax*sigmay/2;
+            vh=max(uh,pay)-pay;
+            //plot(vh, wait=debug, cmm= "vh");
+            uhp=uhp;
+            n=uhp.n;
+            uh=uh;
+            Ik=Ik;
+            lambda=lambda;
+            pay=e;
+            A=a(Vh,Vh,tgv=tgv,solver=CG);
+            AA=a(Vh,Vh);
+            M=vM(Vh,Vh);
+            Aii.resize(n);
+            Aiin.resize(n);
+            Ak.resize(n);
+            b.resize(n);
+            rhs.resize(n);
+            Aii=A.diag; // get the diagonal of the matrix
+        }
+        k++;
+        cout<<" iter = "<<iter<<"  k = "<<k<<endl;
+    }
+    /*real[int] diff(n),Mdiff(n);
+    diff= uh[]-uhp[];
+    Mdiff = M*uh[];
+    Ak=1.;
+    real intuh  = (Ak'*Mdiff); // int uh;
+    res = intuh;*/
+    j++;
+    uhp[]=uh[] ; // set the previous solution
+    iter++;      // and advance the time iterator
+    //cout << "iter = "<< iter <<" res = "<<res<<endl;
+    //cout << "iter = "<<iter<<endl;
+}
+cout << endl;
+cout << "===============================================" << endl;
+cout << "====            CPU time                  =====" << endl;
+cout << "===============================================" << endl;
+cout << " ALL solving steps :::: "  << clock()-time << endl;
+cout<<endl;
+cout << "====          uh(0,0) = "<<uh(0,0)<<"              =====" << endl;
+cout<<endl;
+cout << "====          uh(35,41) = "<<uh(35,41)<<"       =====" << endl;
+cout <<endl;
+
+if (COMPAREMODE == true)
+{
+    cout << "===============================================================" << endl;
+    cout << "==             computing EUROPEAN options basket             ==" << endl;
+    cout << "==                                                           ==" << endl;
+    cout << "    T="<<T<<" sigmax="<<sigmax<<" sigmay="<<sigmay<<" rho="<<rho<<" r="<<r<<" K="<<K<<" dt="<<dt<<endl;
+    cout << "===============================================================" << endl;
+
+// Parameters
+//int m = 30; int L = 80; int LL = 80; int j = 100; real sigx = 0.3; real sigy = 0.3; real rho = 0.3; real r = 0.05; real K = 40; real dt = 0.01;
+
+    // Mesh
+    mesh The=square(m,m,[L*x,LL*y]);
+
+    // Fespace
+    fespace Vhe(The, P1);
+    Vhe vhe, uhpe, uhe = max(K-max(x,y),0.);
+    
+    j=100;
+
+    // Time loop
+    for (n = 0; n*dt <= T; n++) {
+        // Mesh adaptation
+        if (j > 10) {
+            The = adaptmesh(The, uhe, verbosity=1, abserror=1, nbjacoby=2,
+                            err=0.001, nbvx=5000, omega=1.8, ratio=1.8, nbsmooth=3,
+                            splitpbedge=1, maxsubdiv=5, rescaling=1);
+            j = 0;
+            xveloc = -x*r + x*sigmax^2 + x*rho*sigmax*sigmay/2;
+            yveloc = -y*r + y*sigmay^2 + y*rho*sigmax*sigmay/2;
+            uhe = uhe;
+        }
+
+        // Update
+        uhpe = uhe;
+
+        // Solve
+        solve ae(uhe, vhe, init=j, solver=LU)
+            = int2d(The)(
+                  uhe*vhe*(r+1/dt)
+                  + dx(uhe)*dx(vhe)*(x*sigmax)^2/2
+                  + dy(uhe)*dy(vhe)*(y*sigmay)^2/2
+                  + (dy(uhe)*dx(vhe) + dx(uhe)*dy(vhe))*rho*sigmax*sigmay*x*y/2
+              )
+              - int2d(The)(
+                  vhe*convect([xveloc, yveloc], dt, uhpe)/dt
+              )
+              + on(2, 3, uhe=0)
+              ;
+
+        // Update
+        j = j+1;
+    };
+
+    // Plot
+    Vh v=uh-uhe;
+    Vh w=max(uh,pay)-pay;
+    plot(uh, uhe, bb=[[0,0],[40,40]], dim=3, fill= true, wait=true, nbiso=20, cmm= "Compare AMERICAN/EUROPEAN PUT OPTIONS --- enlarge and rotate to see AMERICAN over EUROPEAN", value=true);
+    plot(v, wait=true, cmm= "Early exercise premium of the option", value=true, nbiso=60);
+    plot(v, dim=3, fill=true, wait=true, cmm= "Early exercise premium of the option 3D", value=true, nbiso=40);
+    plot(w, dim=3, fill=true, wait=true, cmm= "Time value of the option 3D", value=true, nbiso=40);
+    // for plotting mesh with gnuplot:
+    // gnuplot> cd 'directory where are files mm-....'
+    // gnuplot> set key autotitle columnheader
+    // gnuplot> splot 'mm-VIA-american.points' title "Put American Options" , 'mm-via-european.points' title "Put European Options"
+    savemesh(Th,"mm-VIA-american",[x,y,uh*1]);
+    savemesh(The,"mm-VIA-european",[x,y,uhe*1]);
+
+    // to build a gnuplot data file
+    // for plotting a 3D text datafile:
+    // set palette rgbformulae 30,31,32
+    // splot "graphTime value of the option 3D.txt" w l pal
+    { 
+    ofstream ff("graphTime value of the option 3D.txt");
+    for (int i=0;i<Th.nt;i++)
+        { 
+        for (int j=0; j <3; j++)
+            ff<<Th[i][j].x  << "    "<< Th[i][j].y<< "  "<<w[][Vh(i,j)]<<endl;
+            ff<<Th[i][0].x  << "    "<< Th[i][0].y<< "  "<<w[][Vh(i,0)]<<endl<<endl<<endl;
+        }
+    }
+    // Compute a cut for comparison in text editor
+    int i;
+    real[int] xx(L),yy(LL),zz(LL);
+    for (i=0; i<L; i++)
+    {
+        x=i/L;
+        y=i/LL;
+        xx[i]=i;
+        yy[i]=uh(i,i); // value of uh at point (i/L , i/LL)
+        zz[i]=uhe(i,i); // value of uhe at the same points of uh for compare
+    }
+    plot([xx,yy],[xx,zz],bb=[[0,0],[80,80]], cmm="Compare AMERICAN/EUROPEAN PUT OPTIONS", value = true, ps="Compare AMERICAN-EUROPEAN.eps",wait=true, aspectratio=true);
+    {   // File for compare uh/uhe in text format
+        // remember that the values on the y-axis are taken at the same value as the x-axis for a square mesh
+        ofstream gnu("plotCOMPAREamerican-european.txt");
+        gnu << "x-axis uhAmerican(y=x) uheEuropean(y=x)" << endl;
+        for (int i = 0; i < L; i++)
+        gnu << xx[i] << " " << yy[i] << " " <<zz[i]<<endl;
+    }
+}
+else {
+    // Default plotting for american options
+    vh=max(uh,pay)-pay;
+    plot(vh,wait=1,value=1,fill=1,cmm="Time value of the option");
+    plot(vh,dim=3, wait=1,value=1,fill=1,cmm="Time value of the option 3D");
+    plot(vh,bb=[[20,20],[50,50]],value=1, fill=0,cmm="vh-zoomed",ps="VIA-vhamerican.eps",wait=1,nbiso=50);
+    plot(uh,wait=1,value=1,fill=1,cmm="uh");
+    plot(uh,wait=1,value=1,fill=0,cmm="uh",ps="VIA-uhamerican.eps", nbiso=50);
+    plot(uh,bb=[[0,0],[40,40]], dim=3, fill= true, wait=true, nbiso=20, cmm= "VIA-uhamerican 3D", value=true);
+    plot(Th,cmm="Th",ps="VIA-Thamerican.eps",wait=1);
+    plot(Th,bb=[[20,20],[50,50]],cmm="Th-zoomed",wait=1);
+    savemesh(Th,"mm-VIA-american",[x,y,uh*1]);
+    //  compute a cut
+    int i;
+    real[int] xx(L),yy(LL);
+    for (i=0; i<L; i++)
+    {
+        x=i/L;
+        y=i/LL;
+        xx[i]=i;
+        yy[i]=uh(i,i); // value of uh at point (i/L , i/LL)
+    }
+    plot([xx,yy],bb=[[0,0],[80,80]], cmm="u like 1d", value = true, ps="VIA-1damerican.eps",wait=true, aspectratio=true); //  like gnuplot plot a cut of u
+    {   // File for gnuplot
+        ofstream gnu("plotVIA-american.gp");
+        for (int i = 0; i < L; i++)
+        gnu << xx[i] << " " << yy[i] << endl;
+    }
+}
